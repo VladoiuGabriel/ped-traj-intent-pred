@@ -104,118 +104,170 @@ class DiTBlock(nn.Module):
 
 
 
-class TrajectoryDiT(nn.Module):
+# class TrajectoryDiT(nn.Module):
+#     """
+#     DiT denoiser for trajectory prediction=>
+#     takes noisy trajectories + context and predicts noise
+#     """
+#     def __init__(
+#         self,
+#         n_waypoints=6,
+#         traj_dim=2,
+#         hidden_dim=256,
+#         context_dim=1536,
+#         num_heads=4,
+#         depth=4,
+#         T=100
+#     ):
+#         super().__init__()
+#         self.n_waypoints = n_waypoints
+#         self.T = T
+
+#         self.traj_proj = nn.Linear(traj_dim, hidden_dim)
+
+#         self.t_proj = nn.Sequential(
+#             nn.Linear(hidden_dim, hidden_dim * 4),
+#             nn.SiLU(),
+#             nn.Linear(hidden_dim * 4, hidden_dim)
+#         )
+
+#         self.blocks = nn.ModuleList([
+#             DiTBlock(hidden_dim, context_dim, num_heads)
+#             for _ in range(depth)
+#         ])
+
+#         self.out_proj = nn.Sequential(
+#             nn.LayerNorm(hidden_dim),
+#             nn.Linear(hidden_dim, traj_dim)
+#         )
+
+#         betas, alphas, alphas_cumprod = get_ddpm_schedule(T)
+#         self.register_buffer('betas', betas)
+#         self.register_buffer('alphas', alphas)
+#         self.register_buffer('alphas_cumprod', alphas_cumprod)
+
+#     def forward(self, x_noisy, t, context):
+#         """
+#         x_noisy: (batch, n_waypoints, 2)   — noisy trajectory
+#         t:       (batch,)                  — integer timesteps
+#         context: (batch, seq_len, 1536)    — qwen2.5 features
+#         returns: (batch, n_waypoints, 2)   — predicted noise
+#         """
+#         x = self.traj_proj(x_noisy)
+
+#         t_emb = timestep_embedding(t, x.shape[-1])   
+#         t_emb = self.t_proj(t_emb)                  
+
+        
+#         for block in self.blocks:
+#             x = block(x, t_emb, context)
+
+       
+#         return self.out_proj(x)  
+
+#     def add_noise(self, x0, t, noise=None):
+#         """
+#         forward diffusion: add noise to clean trajectory x0 at timestep t
+#         x0: (batch, n_waypoints, 2)
+#         t:  (batch,) integer timesteps
+#         """
+#         if noise is None:
+#             noise = torch.randn_like(x0)
+
+#         alpha_bar = self.alphas_cumprod[t]              
+#         alpha_bar = alpha_bar[:, None, None]            
+
+#         x_noisy = torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
+#         return x_noisy, noise
+
+#     @torch.no_grad()
+#     def ddim_sample(self, context, n_samples=6, ddim_steps=20):
+#         """
+#         DDIM sampling: generate n_samples trajectories from noise
+#         context: (1, seq_len, 1536)
+#         returns: (n_samples, n_waypoints, 2)
+#         """
+#         device = next(self.parameters()).device
+
+#         ctx = context.expand(n_samples, -1, -1)
+
+    
+#         x = torch.randn(n_samples, self.n_waypoints, 2, device=device)
+
+        
+#         step_size = self.T // ddim_steps
+#         timesteps = list(range(0, self.T, step_size))[::-1]
+
+#         for i, t_val in enumerate(timesteps):
+#             t_batch = torch.full((n_samples,), t_val, device=device, dtype=torch.long)
+
+#             noise_pred = self.forward(x, t_batch, ctx)
+
+#             alpha_bar_t = self.alphas_cumprod[t_val]
+#             alpha_bar_prev = self.alphas_cumprod[timesteps[i + 1]] \
+#                 if i + 1 < len(timesteps) else torch.tensor(1.0, device=device)
+
+#             x0_pred = (x - torch.sqrt(1 - alpha_bar_t) * noise_pred) \
+#                       / torch.sqrt(alpha_bar_t)
+
+#             x = torch.sqrt(alpha_bar_prev) * x0_pred \
+#                 + torch.sqrt(1 - alpha_bar_prev) * noise_pred
+
+#         return x  
+
+
+
+class TrajectoryFlow(nn.Module):
     """
-    DiT denoiser for trajectory prediction=>
-    takes noisy trajectories + context and predicts noise
+    flow matching variant
     """
     def __init__(
         self,
         n_waypoints=6,
         traj_dim=2,
         hidden_dim=256,
-        context_dim=1536,
-        num_heads=4,
-        depth=4,
-        T=100
+        context_dim=1536
     ):
         super().__init__()
+
         self.n_waypoints = n_waypoints
-        self.T = T
 
         self.traj_proj = nn.Linear(traj_dim, hidden_dim)
 
         self.t_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.Linear(1, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim * 4, hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim)
         )
 
-        self.blocks = nn.ModuleList([
-            DiTBlock(hidden_dim, context_dim, num_heads)
-            for _ in range(depth)
-        ])
+        self.ctx_proj = nn.Linear(context_dim, hidden_dim)
 
-        self.out_proj = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
             nn.Linear(hidden_dim, traj_dim)
         )
 
-        betas, alphas, alphas_cumprod = get_ddpm_schedule(T)
-        self.register_buffer('betas', betas)
-        self.register_buffer('alphas', alphas)
-        self.register_buffer('alphas_cumprod', alphas_cumprod)
-
-    def forward(self, x_noisy, t, context):
+    def forward(self, x_t, t, context):
         """
-        x_noisy: (batch, n_waypoints, 2)   — noisy trajectory
-        t:       (batch,)                  — integer timesteps
-        context: (batch, seq_len, 1536)    — qwen2.5 features
-        returns: (batch, n_waypoints, 2)   — predicted noise
+        x_t: (b, n, 2)
+        t: (b,)
+        context: (b, seq, 1536)
         """
-        x = self.traj_proj(x_noisy)
 
-        t_emb = timestep_embedding(t, x.shape[-1])   
-        t_emb = self.t_proj(t_emb)                  
+        h_x = self.traj_proj(x_t)
 
-        
-        for block in self.blocks:
-            x = block(x, t_emb, context)
+        t = t[:, None].float()
+        h_t = self.t_proj(t).unsqueeze(1).expand_as(h_x)
 
-       
-        return self.out_proj(x)  
+        ctx = context.mean(dim=1)
+        h_c = self.ctx_proj(ctx).unsqueeze(1).expand_as(h_x)
 
-    def add_noise(self, x0, t, noise=None):
-        """
-        forward diffusion: add noise to clean trajectory x0 at timestep t
-        x0: (batch, n_waypoints, 2)
-        t:  (batch,) integer timesteps
-        """
-        if noise is None:
-            noise = torch.randn_like(x0)
+        h = torch.cat([h_x, h_t, h_c], dim=-1)
 
-        alpha_bar = self.alphas_cumprod[t]              
-        alpha_bar = alpha_bar[:, None, None]            
-
-        x_noisy = torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
-        return x_noisy, noise
-
-    @torch.no_grad()
-    def ddim_sample(self, context, n_samples=6, ddim_steps=20):
-        """
-        DDIM sampling: generate n_samples trajectories from noise
-        context: (1, seq_len, 1536)
-        returns: (n_samples, n_waypoints, 2)
-        """
-        device = next(self.parameters()).device
-
-        ctx = context.expand(n_samples, -1, -1)
-
-    
-        x = torch.randn(n_samples, self.n_waypoints, 2, device=device)
-
-        
-        step_size = self.T // ddim_steps
-        timesteps = list(range(0, self.T, step_size))[::-1]
-
-        for i, t_val in enumerate(timesteps):
-            t_batch = torch.full((n_samples,), t_val, device=device, dtype=torch.long)
-
-            noise_pred = self.forward(x, t_batch, ctx)
-
-            alpha_bar_t = self.alphas_cumprod[t_val]
-            alpha_bar_prev = self.alphas_cumprod[timesteps[i + 1]] \
-                if i + 1 < len(timesteps) else torch.tensor(1.0, device=device)
-
-            x0_pred = (x - torch.sqrt(1 - alpha_bar_t) * noise_pred) \
-                      / torch.sqrt(alpha_bar_t)
-
-            x = torch.sqrt(alpha_bar_prev) * x0_pred \
-                + torch.sqrt(1 - alpha_bar_prev) * noise_pred
-
-        return x  
-
-
+        return self.net(h)
 
 
 class PedTrajModel(nn.Module):
@@ -249,15 +301,24 @@ class PedTrajModel(nn.Module):
             param.requires_grad = False
 
        
-        self.dit = TrajectoryDiT(
+        # self.dit = TrajectoryDiT(
+        #     n_waypoints=6,
+        #     traj_dim=2,
+        #     hidden_dim=256,
+        #     context_dim=1536,
+        #     num_heads=4,
+        #     depth=4,
+        #     T=100
+        # )
+        
+        self.flow = TrajectoryFlow(
             n_waypoints=6,
             traj_dim=2,
             hidden_dim=256,
-            context_dim=1536,
-            num_heads=4,
-            depth=4,
-            T=100
+            context_dim=1536
         )
+        
+        
 
     def encode_image(self, images):
         """
@@ -318,6 +379,17 @@ class PedTrajModel(nn.Module):
 
         context = torch.cat([visual_tokens, text_features], dim=1)
         return context
+    
+    def flow_matching_loss(self, context, x0):
+        b = x0.shape[0]
+        z = torch.randn_like(x0)
+        t = torch.rand(b, device=self.device)
+        t_exp = t[:, None, None]
+        x_t = (1 - t_exp) * x0 + t_exp * z
+        target = z - x0
+        pred = self.flow(x_t, t, context)
+
+        return nn.functional.mse_loss(pred, target)
 
     def forward(self, images, obs, pred_gt):
         """
@@ -328,25 +400,38 @@ class PedTrajModel(nn.Module):
         Returns: diffusion loss (scalar)
         """
         context = self.get_context(images, obs) 
+        # batch_size = pred_gt.shape[0]
+        # t = torch.randint(0, self.dit.T, (batch_size,), device=self.device)
 
-        batch_size = pred_gt.shape[0]
+        # x_noisy, noise = self.dit.add_noise(pred_gt, t)
+        # noise_pred = self.dit(x_noisy, t, context)
 
-        t = torch.randint(0, self.dit.T, (batch_size,), device=self.device)
+        # loss = nn.functional.mse_loss(noise_pred, noise)
+        # return loss
+        
+        return self.flow_matching_loss(context, pred_gt)
+        
 
-        x_noisy, noise = self.dit.add_noise(pred_gt, t)
-
-        noise_pred = self.dit(x_noisy, t, context)
-
-        loss = nn.functional.mse_loss(noise_pred, noise)
-        return loss
-
+    # @torch.no_grad()
+    # def predict(self, images, obs, n_samples=6):
+    #     """
+    #     inference: generate n_samples trajectory predictions
+    #     image: list of PIL Image
+    #     obs:   (1, 4, 2) observed trajectory
+    #     returns: (n_samples, 6, 2) predicted trajectories
+    #     """
+    #     context = self.get_context(images, obs) 
+    #     return self.dit.ddim_sample(context, n_samples=n_samples, ddim_steps=20)
+    
     @torch.no_grad()
-    def predict(self, images, obs, n_samples=6):
-        """
-        inference: generate n_samples trajectory predictions
-        image: list of PIL Image
-        obs:   (1, 4, 2) observed trajectory
-        returns: (n_samples, 6, 2) predicted trajectories
-        """
-        context = self.get_context(images, obs) 
-        return self.dit.ddim_sample(context, n_samples=n_samples, ddim_steps=20)
+    def predict_flow(self, images, obs, n_samples=6, steps=20):
+        context = self.get_context(images, obs)
+        device = self.device
+        x = torch.randn(n_samples, 6, 2, device=device)
+        dt = 1.0 / steps
+        ctx = context.expand(n_samples, -1, -1)
+        for i in range(steps):
+            t = torch.full((n_samples,), i / steps, device=device)
+            v = self.flow(x, t, ctx)
+            x = x - v * dt
+        return x
