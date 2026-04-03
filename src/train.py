@@ -69,12 +69,12 @@ def train():
 
     print("Loading model...", flush=True)
     model = PedTrajModel(device=device)
-    model.dit    = model.dit.to(device)
     model.bridge = model.bridge.to(device)
     model.clip   = model.clip.to(device)
+    model.flow   = model.flow.to(device)
 
     trainable_params = list(model.bridge.parameters()) + \
-                       list(model.dit.parameters())
+                       list(model.flow.parameters())
     print(f"Trainable params: {sum(p.numel() for p in trainable_params)/1e6:.2f}M", flush=True)
 
     optimizer = torch.optim.AdamW(trainable_params, lr=CONFIG['lr'])
@@ -85,7 +85,7 @@ def train():
     best_val_loss = float('inf')
 
     for epoch in range(1, CONFIG['epochs'] + 1):
-        model.dit.train()
+        model.flow.train()
         model.bridge.train()
 
         train_loss = 0.0
@@ -109,8 +109,7 @@ def train():
         scheduler.step()
         avg_train_loss = train_loss / len(train_loader)
 
-        # validation
-        model.dit.eval()
+        model.flow.eval()
         model.bridge.eval()
 
         val_loss = 0.0
@@ -146,15 +145,15 @@ def train():
             best_val_loss = avg_val_loss
             ckpt_path = os.path.join(CONFIG['save_dir'], 'best_model.pt')
             torch.save({
-                'epoch':    epoch,
-                'bridge':   model.bridge.state_dict(),
-                'dit':      model.dit.state_dict(),
+                'epoch':     epoch,
+                'bridge':    model.bridge.state_dict(),
+                'flow':      model.flow.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-                'ade':      avg_ade,
-                'fde':      avg_fde,
+                'val_loss':  avg_val_loss,
+                'ade':       avg_ade,
+                'fde':       avg_fde,
             }, ckpt_path)
-            print(f"  Saved best model → {ckpt_path}", flush=True)
+            print(f"  Saved best model -> {ckpt_path}", flush=True)
 
     print(f"\nTraining complete! Best val loss: {best_val_loss:.4f}")
 
