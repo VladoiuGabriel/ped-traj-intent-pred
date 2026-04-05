@@ -1,35 +1,11 @@
 import torch
 import torch.nn as nn
 import math
-from transformers import CLIPVisionModel, CLIPImageProcessor
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig, get_peft_model, TaskType
-
-
-class MLPBridge(nn.Module):
-    """
-    Projects CLIP patch tokens to Qwen2.5 hidden dimension.
-    Input:  (batch, 197, 768)
-    Output: (batch, 197, 1536)
-    """
-    def __init__(self, clip_dim=768, qwen_dim=1536):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(clip_dim, qwen_dim),
-            nn.GELU(),
-            nn.Linear(qwen_dim, qwen_dim)
-        )
-
-    def forward(self, x):
-        return self.net(x)
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 
 
 def timestep_embedding(t, dim):
-    """
-    Sinusoidal timestep embedding.
-    t:   (batch,) integer timesteps
-    dim: embedding dimension
-    """
     half = dim // 2
     freqs = torch.exp(
         -math.log(10000) * torch.arange(half, device=t.device) / half
@@ -38,15 +14,26 @@ def timestep_embedding(t, dim):
     return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
 
+class PlanningTokenProjector(nn.Module):
+    """3584 to 256 two layer mlp with relu"""
+
+    def __init__(self, vlm_dim=3584, flow_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(vlm_dim, vlm_dim // 2),
+            nn.ReLU(),
+            nn.Linear(vlm_dim // 2, flow_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x).unsqueeze(1)
+
+
 class FlowDiTBlock(nn.Module):
-    """
-    DiT block adapted for flow matching with:
-    - AdaLN conditioned on continuous timestep t in [0,1]
-    - Self-attention over waypoints
-    - Cross-attention on context (Qwen2.5 + visual features)
-    - FFN
-    """
-    def __init__(self, hidden_dim=256, context_dim=1536, num_heads=4):
+    """adaln self-attn cross-attn on planning token ffn"""
+
+    def __init__(self, hidden_dim=256, context_dim=256, num_heads=4):
         super().__init__()
 
         self.adaLN = nn.Sequential(
@@ -75,11 +62,6 @@ class FlowDiTBlock(nn.Module):
         )
 
     def forward(self, x, t_emb, context):
-        """
-        x:       (batch, n_waypoints, hidden_dim)
-        t_emb:   (batch, hidden_dim)
-        context: (batch, seq_len, context_dim)
-        """
         ada = self.adaLN(t_emb).unsqueeze(1)
         s1, b1, s2, b2, s3, b3 = ada.chunk(6, dim=-1)
 
@@ -98,19 +80,14 @@ class FlowDiTBlock(nn.Module):
 
 
 class TrajectoryFlowDiT(nn.Module):
-    """
-    Flow Matching DiT for trajectory prediction.
-    Learns a velocity field v(x_t, t, context) that transports
-    noise z ~ N(0,I) to clean trajectory x0 along straight paths:
-        x(t) = (1-t)*z + t*x0
-        v_target = x0 - z
-    """
+    """flow matching dit conditioned on planning token"""
+
     def __init__(
         self,
         n_waypoints=6,
         traj_dim=2,
         hidden_dim=256,
-        context_dim=1536,
+        context_dim=256,
         num_heads=4,
         depth=4
     ):
@@ -136,15 +113,8 @@ class TrajectoryFlowDiT(nn.Module):
         )
 
     def forward(self, x_t, t, context):
-        """
-        x_t:     (batch, n_waypoints, 2)  — interpolated trajectory
-        t:       (batch,)                 — continuous timestep in [0,1]
-        context: (batch, seq_len, 1536)   — visual + language context
-        Returns: (batch, n_waypoints, 2)  — predicted velocity field
-        """
         x = self.traj_proj(x_t)
-
-        t_emb = timestep_embedding((t * 999).long(), x.shape[-1])
+        t_emb = timestep_embedding(t, x.shape[-1])
         t_emb = self.t_proj(t_emb)
 
         for block in self.blocks:
@@ -154,119 +124,112 @@ class TrajectoryFlowDiT(nn.Module):
 
 
 class PedTrajModel(nn.Module):
-    
-    def __init__(self, device='cuda', lora_rank=16, lora_alpha=16):
+    """qwen2-vl-3b frozen extracts planning token mlp projects to flowdit"""
+
+    def __init__(
+        self,
+        device='cuda',
+        vlm_name='Qwen/Qwen2-VL-3B-Instruct',
+        sigma=0.1,
+        waypoint_dropout=0.15
+    ):
         super().__init__()
         self.device = device
+        self.sigma = sigma
+        self.waypoint_dropout = waypoint_dropout
 
-        self.clip_processor = CLIPImageProcessor.from_pretrained(
-            "openai/clip-vit-base-patch16"
+        print("Loading Qwen2-VL-3B...", flush=True)
+        self.processor = AutoProcessor.from_pretrained(vlm_name)
+
+        self.processor.tokenizer.add_special_tokens(
+            {'additional_special_tokens': ['[PLAN]']}
         )
-        self.clip = CLIPVisionModel.from_pretrained(
-            "openai/clip-vit-base-patch16"
-        )
-        for param in self.clip.parameters():
-            param.requires_grad = False
+        self.plan_token_id = self.processor.tokenizer.convert_tokens_to_ids('[PLAN]')
 
-        self.bridge = MLPBridge(clip_dim=768, qwen_dim=1536)
-
-        self.qwen_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B")
-        self.qwen = AutoModelForCausalLM.from_pretrained(
-            "Qwen/Qwen2.5-1.5B",
+        self.vlm = Qwen2VLForConditionalGeneration.from_pretrained(
+            vlm_name,
             torch_dtype=torch.float16,
             device_map="auto"
         )
+        self.vlm.resize_token_embeddings(len(self.processor.tokenizer))
 
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=0.1,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-            bias="none"
-        )
-        self.qwen = get_peft_model(self.qwen, lora_config)
-        self.qwen.print_trainable_parameters()
+        for param in self.vlm.parameters():
+            param.requires_grad = False
 
-        # LayerNorm to fix scale mismatch between CLIP and Qwen features
-        self.clip_norm = nn.LayerNorm(1536)
-        self.qwen_norm = nn.LayerNorm(1536)
+        print("Qwen2-VL-3B loaded and frozen", flush=True)
+
+        self.projector = PlanningTokenProjector(vlm_dim=2048, flow_dim=256)
 
         self.flow = TrajectoryFlowDiT(
             n_waypoints=6,
             traj_dim=2,
             hidden_dim=256,
-            context_dim=1536,
+            context_dim=256,
             num_heads=4,
             depth=4
         )
 
-    def encode_image(self, images):
-        """
-        images: list of PIL Images (batch_size)
-        returns: (batch_size, 197, 1536) visual tokens in Qwen space
-        """
-        inputs = self.clip_processor(
-            images=images, return_tensors="pt"
-        ).to(self.device)
+    def get_planning_token(self, images, obs):
+        """runs vlm forward and extracts hidden state at [PLAN] position"""
+        batch_size = obs.shape[0]
+        planning_tokens = []
 
-        with torch.no_grad():
-            clip_out = self.clip(**inputs)
-            patch_tokens = clip_out.last_hidden_state
-
-        return self.bridge(patch_tokens.float())
-
-    def encode_obs_trajectory(self, obs):
-        """
-        obs: (batch, 4, 2) observed waypoints
-        returns: (batch, seq_len, 1536) Qwen2.5 hidden states
-        """
-        prompts = []
-        for b in range(obs.shape[0]):
+        for b in range(batch_size):
             coords = ", ".join(
                 [f"({obs[b, i, 0]:.2f}, {obs[b, i, 1]:.2f})"
                  for i in range(obs.shape[1])]
             )
-            prompts.append(
-                f"A pedestrian was observed at positions: {coords}. "
-                f"Predict the future trajectory."
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": images[b]},
+                        {"type": "text", "text":
+                            f"A pedestrian was observed at positions: {coords}. "
+                            f"Plan the trajectory. [PLAN]"
+                        }
+                    ]
+                }
+            ]
+
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
             )
+            image_inputs, _ = process_vision_info(messages)
 
-        tokens = self.qwen_tokenizer(
-            prompts, return_tensors="pt",
-            padding=True, truncation=True
-        ).to(self.device)
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs,
+                return_tensors="pt",
+                padding=True
+            ).to(self.device)
 
-        qwen_out = self.qwen(
-            **tokens,
-            output_hidden_states=True
-        )
-        text_features = qwen_out.hidden_states[-1]
+            with torch.no_grad():
+                outputs = self.vlm(**inputs, output_hidden_states=True)
 
-        return text_features.float()
+            input_ids = inputs['input_ids'][0]
+            plan_positions = (input_ids == self.plan_token_id).nonzero(as_tuple=True)[0]
+            plan_pos = plan_positions[-1].item() if len(plan_positions) > 0 else -1
 
-    def get_context(self, images, obs):
-        """
-        images: list of PIL Images
-        obs:    (batch, 4, 2) observed trajectory
-        returns: (batch, 197+seq_len, 1536)
-        """
-        visual_tokens = self.encode_image(images)
-        text_features = self.encode_obs_trajectory(obs)
+            hidden = outputs.hidden_states[-1][0, plan_pos, :]
+            planning_tokens.append(hidden)
 
-        # normalize to same scale before concatenation
-        visual_tokens = self.clip_norm(visual_tokens)
-        text_features = self.qwen_norm(text_features)
+        return torch.stack(planning_tokens).float()
 
-        return torch.cat([visual_tokens, text_features], dim=1)
+    def apply_waypoint_dropout(self, obs):
+        """zeros out random waypoints with p=0.15 during training"""
+        if not self.training:
+            return obs
+        mask = torch.bernoulli(
+            torch.full((obs.shape[0], obs.shape[1]), 1 - self.waypoint_dropout)
+        ).to(obs.device)
+        return obs * mask.unsqueeze(-1)
 
     def flow_matching_loss(self, context, x0):
-        """
-        flow matching loss
-        x0: (batch, 6, 2) ground truth future trajectory
-        """
+        """flow matching loss with sigma=0.1 noise"""
         b = x0.shape[0]
-        z = torch.randn_like(x0)
+        z = torch.randn_like(x0) * self.sigma
         t = torch.rand(b, device=self.device)
         t_exp = t[:, None, None]
 
@@ -277,26 +240,20 @@ class PedTrajModel(nn.Module):
         return nn.functional.mse_loss(v_pred, v_target)
 
     def forward(self, images, obs, pred_gt):
-        """
-        images:  list of PIL Images
-        obs:     (batch, 4, 2) observed trajectory
-        pred_gt: (batch, 6, 2) ground truth future trajectory
-        returns: flow matching loss (scalar)
-        """
-        context = self.get_context(images, obs)
+        """training forward pass"""
+        obs = self.apply_waypoint_dropout(obs)
+        planning_token = self.get_planning_token(images, obs)
+        context = self.projector(planning_token)
         return self.flow_matching_loss(context, pred_gt)
 
     @torch.no_grad()
     def predict(self, images, obs, n_samples=6, steps=50):
-        """
-        images: list of PIL Images
-        obs:    (1, 4, 2) observed trajectory
-        returns: (n_samples, 6, 2) predicted trajectories
-        """
-        context = self.get_context(images, obs)
+        """generates n_samples trajectories via euler integration"""
+        planning_token = self.get_planning_token(images, obs)
+        context = self.projector(planning_token)
         ctx = context.expand(n_samples, -1, -1)
 
-        x = torch.randn(n_samples, self.flow.n_waypoints, 2, device=self.device)
+        x = torch.randn(n_samples, self.flow.n_waypoints, 2, device=self.device) * self.sigma
         dt = 1.0 / steps
 
         for i in range(steps):

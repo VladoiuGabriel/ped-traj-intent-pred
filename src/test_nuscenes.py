@@ -2,7 +2,7 @@ from nuscenes.nuscenes import NuScenes
 
 nusc = NuScenes(
     version='v1.0-mini',
-    dataroot=r'C:\Users\Gabi\pedtraj\data\nuscenes',
+    dataroot=r'/home/student02/data/nuscenes',
     verbose=True
 )
 
