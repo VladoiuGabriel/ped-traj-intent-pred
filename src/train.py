@@ -9,17 +9,22 @@ from nuscenes.nuscenes import NuScenes
 from dataset import PedestrianDataset, collate_fn
 from model import PedTrajModel
 
+import argparse
 
-CONFIG = {
-    'dataroot':   r'C:\Users\Gabi\pedtraj\data\nuscenes',
-    'version':    'v1.0-mini',
-    'batch_size': 4,
-    'lr':         1e-4,
-    'epochs':     50,
-    'val_split':  0.2,
-    'save_dir':   r'C:\Users\Gabi\pedtraj\checkpoints',
-    'log_every':  10,
-}
+def get_config():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataroot', default=r'C:\Users\Gabi\pedtraj\data\nuscenes')
+    parser.add_argument('--save_dir', default=r'C:\Users\Gabi\pedtraj\checkpoints')
+    parser.add_argument('--version',  default='v1.0-mini')
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--epochs',     type=int, default=50)
+    parser.add_argument('--lr',         type=float, default=1e-4)
+    parser.add_argument('--lora_rank',  type=int, default=16)
+    parser.add_argument('--lora_alpha', type=int, default=16)
+    parser.add_argument('--log_every',  type=int, default=10)
+    parser.add_argument('--val_split',  type=float, default=0.2)
+    args = parser.parse_args()
+    return vars(args)
 
 
 def compute_ade(pred, gt):
@@ -68,13 +73,24 @@ def train():
     )
 
     print("Loading model...", flush=True)
-    model = PedTrajModel(device=device)
-    model.bridge = model.bridge.to(device)
-    model.clip   = model.clip.to(device)
-    model.flow   = model.flow.to(device)
+    model = PedTrajModel(
+        device=device,
+        lora_rank=CONFIG['lora_rank'],
+        lora_alpha=CONFIG['lora_alpha']
+    )
+    model.bridge    = model.bridge.to(device)
+    model.clip      = model.clip.to(device)
+    model.flow      = model.flow.to(device)
+    model.clip_norm = model.clip_norm.to(device)
+    model.qwen_norm = model.qwen_norm.to(device)
 
-    trainable_params = list(model.bridge.parameters()) + \
-                       list(model.flow.parameters())
+    trainable_params = (
+        list(model.bridge.parameters())    +
+        list(model.flow.parameters())      +
+        list(model.clip_norm.parameters()) +
+        list(model.qwen_norm.parameters()) +
+        [p for p in model.qwen.parameters() if p.requires_grad]
+    )
     print(f"Trainable params: {sum(p.numel() for p in trainable_params)/1e6:.2f}M", flush=True)
 
     optimizer = torch.optim.AdamW(trainable_params, lr=CONFIG['lr'])
@@ -87,6 +103,9 @@ def train():
     for epoch in range(1, CONFIG['epochs'] + 1):
         model.flow.train()
         model.bridge.train()
+        model.clip_norm.train()
+        model.qwen_norm.train()
+        model.qwen.train()
 
         train_loss = 0.0
         for batch_idx, batch in enumerate(train_loader):
@@ -111,6 +130,9 @@ def train():
 
         model.flow.eval()
         model.bridge.eval()
+        model.clip_norm.eval()
+        model.qwen_norm.eval()
+        model.qwen.eval()
 
         val_loss = 0.0
         val_ade  = 0.0
@@ -145,17 +167,20 @@ def train():
             best_val_loss = avg_val_loss
             ckpt_path = os.path.join(CONFIG['save_dir'], 'best_model.pt')
             torch.save({
-                'epoch':     epoch,
-                'bridge':    model.bridge.state_dict(),
-                'flow':      model.flow.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'val_loss':  avg_val_loss,
-                'ade':       avg_ade,
-                'fde':       avg_fde,
+                'epoch':      epoch,
+                'bridge':     model.bridge.state_dict(),
+                'flow':       model.flow.state_dict(),
+                'clip_norm':  model.clip_norm.state_dict(),
+                'qwen_norm':  model.qwen_norm.state_dict(),
+                'qwen_lora':  model.qwen.state_dict(),
+                'optimizer':  optimizer.state_dict(),
+                'val_loss':   avg_val_loss,
+                'ade':        avg_ade,
+                'fde':        avg_fde,
             }, ckpt_path)
-            print(f"  Saved best model -> {ckpt_path}", flush=True)
+            print(f" saved best checkpoint model at {ckpt_path}", flush=True)
 
-    print(f"\nTraining complete! Best val loss: {best_val_loss:.4f}")
+    print(f"\ntraining complete, best val loss: {best_val_loss:.4f}")
 
 
 if __name__ == '__main__':

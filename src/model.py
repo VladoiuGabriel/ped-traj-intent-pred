@@ -3,6 +3,7 @@ import torch.nn as nn
 import math
 from transformers import CLIPVisionModel, CLIPImageProcessor
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model, TaskType
 
 
 class MLPBridge(nn.Module):
@@ -153,11 +154,8 @@ class TrajectoryFlowDiT(nn.Module):
 
 
 class PedTrajModel(nn.Module):
-    """
-    Full pipeline:
-    CLIP-ViT (frozen) -> MLP Bridge -> concat with obs tokens -> Qwen2.5 -> FlowDiT head
-    """
-    def __init__(self, device='cuda'):
+    
+    def __init__(self, device='cuda', lora_rank=16, lora_alpha=16):
         super().__init__()
         self.device = device
 
@@ -178,8 +176,21 @@ class PedTrajModel(nn.Module):
             torch_dtype=torch.float16,
             device_map="auto"
         )
-        for param in self.qwen.parameters():
-            param.requires_grad = False
+
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=0.1,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            bias="none"
+        )
+        self.qwen = get_peft_model(self.qwen, lora_config)
+        self.qwen.print_trainable_parameters()
+
+        # LayerNorm to fix scale mismatch between CLIP and Qwen features
+        self.clip_norm = nn.LayerNorm(1536)
+        self.qwen_norm = nn.LayerNorm(1536)
 
         self.flow = TrajectoryFlowDiT(
             n_waypoints=6,
@@ -193,7 +204,7 @@ class PedTrajModel(nn.Module):
     def encode_image(self, images):
         """
         images: list of PIL Images (batch_size)
-        Returns: (batch_size, 197, 1536) visual tokens in Qwen space
+        returns: (batch_size, 197, 1536) visual tokens in Qwen space
         """
         inputs = self.clip_processor(
             images=images, return_tensors="pt"
@@ -208,7 +219,7 @@ class PedTrajModel(nn.Module):
     def encode_obs_trajectory(self, obs):
         """
         obs: (batch, 4, 2) observed waypoints
-        Returns: (batch, seq_len, 1536) Qwen2.5 hidden states
+        returns: (batch, seq_len, 1536) Qwen2.5 hidden states
         """
         prompts = []
         for b in range(obs.shape[0]):
@@ -226,12 +237,11 @@ class PedTrajModel(nn.Module):
             padding=True, truncation=True
         ).to(self.device)
 
-        with torch.no_grad():
-            qwen_out = self.qwen(
-                **tokens,
-                output_hidden_states=True
-            )
-            text_features = qwen_out.hidden_states[-1]
+        qwen_out = self.qwen(
+            **tokens,
+            output_hidden_states=True
+        )
+        text_features = qwen_out.hidden_states[-1]
 
         return text_features.float()
 
@@ -239,16 +249,20 @@ class PedTrajModel(nn.Module):
         """
         images: list of PIL Images
         obs:    (batch, 4, 2) observed trajectory
-        Returns: (batch, 197+seq_len, 1536)
+        returns: (batch, 197+seq_len, 1536)
         """
         visual_tokens = self.encode_image(images)
         text_features = self.encode_obs_trajectory(obs)
+
+        # normalize to same scale before concatenation
+        visual_tokens = self.clip_norm(visual_tokens)
+        text_features = self.qwen_norm(text_features)
 
         return torch.cat([visual_tokens, text_features], dim=1)
 
     def flow_matching_loss(self, context, x0):
         """
-        Flow matching training loss.
+        flow matching loss
         x0: (batch, 6, 2) ground truth future trajectory
         """
         b = x0.shape[0]
@@ -264,11 +278,10 @@ class PedTrajModel(nn.Module):
 
     def forward(self, images, obs, pred_gt):
         """
-        Training forward pass.
         images:  list of PIL Images
         obs:     (batch, 4, 2) observed trajectory
         pred_gt: (batch, 6, 2) ground truth future trajectory
-        Returns: flow matching loss (scalar)
+        returns: flow matching loss (scalar)
         """
         context = self.get_context(images, obs)
         return self.flow_matching_loss(context, pred_gt)
@@ -276,10 +289,9 @@ class PedTrajModel(nn.Module):
     @torch.no_grad()
     def predict(self, images, obs, n_samples=6, steps=50):
         """
-        Inference: generate n_samples trajectory predictions via Euler integration.
         images: list of PIL Images
         obs:    (1, 4, 2) observed trajectory
-        Returns: (n_samples, 6, 2) predicted trajectories
+        returns: (n_samples, 6, 2) predicted trajectories
         """
         context = self.get_context(images, obs)
         ctx = context.expand(n_samples, -1, -1)
