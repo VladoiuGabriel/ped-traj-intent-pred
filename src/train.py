@@ -17,7 +17,7 @@ def get_config():
     parser.add_argument('--dataroot',         default='/home/student02/data/nuscenes')
     parser.add_argument('--save_dir',         default='/home/student02/data/checkpoints')
     parser.add_argument('--version',          default='v1.0-mini')
-    parser.add_argument('--vlm_name',         default='Qwen/Qwen2-VL-3B-Instruct')
+    parser.add_argument('--vlm_name',         default='Qwen/Qwen2.5-VL-3B-Instruct')
     parser.add_argument('--batch_size',       type=int,   default=4)
     parser.add_argument('--epochs',           type=int,   default=50)
     parser.add_argument('--lr',               type=float, default=3e-4)

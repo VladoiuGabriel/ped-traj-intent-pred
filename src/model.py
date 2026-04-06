@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
 
@@ -138,7 +138,7 @@ class PedTrajModel(nn.Module):
         self.sigma = sigma
         self.waypoint_dropout = waypoint_dropout
 
-        print("Loading Qwen2-VL-3B...", flush=True)
+        print("Loading Qwen2.5-VL-3B...", flush=True)
         self.processor = AutoProcessor.from_pretrained(vlm_name)
 
         self.processor.tokenizer.add_special_tokens(
@@ -146,7 +146,7 @@ class PedTrajModel(nn.Module):
         )
         self.plan_token_id = self.processor.tokenizer.convert_tokens_to_ids('[PLAN]')
 
-        self.vlm = Qwen2VLForConditionalGeneration.from_pretrained(
+        self.vlm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             vlm_name,
             torch_dtype=torch.float16,
             device_map="auto"
