@@ -3,6 +3,7 @@ import torch.nn as nn
 import math
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
+from peft import LoraConfig, get_peft_model, TaskType
 
 
 def timestep_embedding(t, dim):
@@ -15,9 +16,9 @@ def timestep_embedding(t, dim):
 
 
 class PlanningTokenProjector(nn.Module):
-    """3584 to 256 two layer mlp with relu"""
+    """2048 to 256 two layer mlp with relu"""
 
-    def __init__(self, vlm_dim=3584, flow_dim=256):
+    def __init__(self, vlm_dim=2048, flow_dim=256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(vlm_dim, vlm_dim // 2),
@@ -131,7 +132,10 @@ class PedTrajModel(nn.Module):
         device='cuda',
         vlm_name='Qwen/Qwen2.5-VL-3B-Instruct',
         sigma=0.1,
-        waypoint_dropout=0.15
+        waypoint_dropout=0.15,
+        use_lora=False,
+        lora_rank=16,
+        lora_alpha=16
     ):
         super().__init__()
         self.device = device
@@ -155,8 +159,25 @@ class PedTrajModel(nn.Module):
 
         for param in self.vlm.parameters():
             param.requires_grad = False
+        
+        if use_lora:
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=0.1,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                bias="none"
+            )
+            self.vlm = get_peft_model(self.vlm, lora_config)
+            for name, param in self.vlm.named_parameters():
+                if 'visual' in name and 'lora' not in name:
+                    param.requires_grad = False
+            self.vlm.print_trainable_parameters()
 
-        print("Qwen2-VL-3B loaded and frozen", flush=True)
+            print("Qwen2-VL-3B Lora Training ready", flush=True)
+        else:
+            print("Qwen2-VL-3B loaded and frozen", flush=True)
 
         self.projector = PlanningTokenProjector(vlm_dim=2048, flow_dim=256)
 
@@ -205,7 +226,10 @@ class PedTrajModel(nn.Module):
                 padding=True
             ).to(self.device)
 
-            with torch.no_grad():
+            if not self.vlm.training:
+                with torch.no_grad():
+                    outputs = self.vlm(**inputs, output_hidden_states=True)
+            else:
                 outputs = self.vlm(**inputs, output_hidden_states=True)
 
             input_ids = inputs['input_ids'][0]
