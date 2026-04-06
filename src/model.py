@@ -129,7 +129,7 @@ class PedTrajModel(nn.Module):
     def __init__(
         self,
         device='cuda',
-        vlm_name='Qwen/Qwen2-VL-3B-Instruct',
+        vlm_name='Qwen/Qwen2.5-VL-3B-Instruct',
         sigma=0.1,
         waypoint_dropout=0.15
     ):
