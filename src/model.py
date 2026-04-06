@@ -148,7 +148,7 @@ class PedTrajModel(nn.Module):
 
         self.vlm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             vlm_name,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             device_map="auto"
         )
         self.vlm.resize_token_embeddings(len(self.processor.tokenizer))
@@ -212,7 +212,9 @@ class PedTrajModel(nn.Module):
             plan_positions = (input_ids == self.plan_token_id).nonzero(as_tuple=True)[0]
             plan_pos = plan_positions[-1].item() if len(plan_positions) > 0 else -1
 
-            hidden = outputs.hidden_states[-1][0, plan_pos, :]
+            hidden_raw = outputs.hidden_states[-1][0, plan_pos, :].to(torch.float32)
+            #print(f"sample {b} | dtype: {hidden_raw.dtype} | has nan: {torch.isnan(hidden_raw.float()).any().item()} | max abs: {hidden_raw.float().abs().max().item():.2f}")
+            hidden = hidden_raw.float()
             planning_tokens.append(hidden)
 
         return torch.stack(planning_tokens).float()
