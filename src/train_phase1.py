@@ -1,7 +1,9 @@
 import sys
 import os
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import wandb
 import torch
 from torch.utils.data import DataLoader, random_split
 from nuscenes.nuscenes import NuScenes
@@ -42,6 +44,13 @@ def compute_fde(pred, gt):
 
 def train():
     CONFIG = get_config()
+    
+    wandb.init(
+        project = "ped-traj-pred",
+        name = "phase1",
+        config = CONFIG
+    )
+    
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"device: {device}", flush=True)
 
@@ -120,6 +129,7 @@ def train():
             if batch_idx % CONFIG['log_every'] == 0:
                 print(f"  epoch {epoch} | batch {batch_idx}/{len(train_loader)} "
                       f"| loss: {loss.item():.4f}", flush=True)
+                wandb.log({'train_loss_step': loss.item()})
 
         scheduler.step()
         avg_train_loss = train_loss / len(train_loader)
@@ -155,6 +165,15 @@ def train():
               f"val: {avg_val_loss:.4f} | "
               f"minADE: {avg_ade:.3f}m | "
               f"minFDE: {avg_fde:.3f}m\n", flush=True)
+        
+        
+        wandb.log({
+            'epoch':      epoch,
+            'train_loss': avg_train_loss,
+            'val_loss':   avg_val_loss,
+            'minADE':     avg_ade,
+            'minFDE':     avg_fde
+        })
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -169,6 +188,8 @@ def train():
                 'fde':        avg_fde,
             }, ckpt_path)
             print(f"saved best model at {ckpt_path}", flush=True)
+            
+    wandb.finish()
 
     print(f"\ntraining complete, best val loss: {best_val_loss:.4f}")
 

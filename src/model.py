@@ -125,7 +125,7 @@ class TrajectoryFlowDiT(nn.Module):
 
 
 class PedTrajModel(nn.Module):
-    """qwen2-vl-3b frozen extracts planning token mlp projects to flowdit"""
+    """qwen2-vl-3b extracts planning token mlp projects to flowdit"""
 
     def __init__(
         self,
@@ -153,9 +153,10 @@ class PedTrajModel(nn.Module):
         self.vlm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             vlm_name,
             torch_dtype=torch.bfloat16,
-            device_map="auto"
+             device_map={"": device}
         )
         self.vlm.resize_token_embeddings(len(self.processor.tokenizer))
+        self.vlm.gradient_checkpointing_enable()
 
         for param in self.vlm.parameters():
             param.requires_grad = False

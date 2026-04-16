@@ -3,8 +3,12 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, random_split
+from torch.utils.data.distributed import DistributedSampler
 from nuscenes.nuscenes import NuScenes
+import wandb
 
 from dataset import PedestrianDataset, collate_fn
 from model import PedTrajModel
@@ -19,7 +23,7 @@ def get_config():
     parser.add_argument('--phase1_ckpt',      default='/home/student02/data/checkpoints/best_model.pt')
     parser.add_argument('--version',          default='v1.0-mini')
     parser.add_argument('--vlm_name',         default='Qwen/Qwen2.5-VL-3B-Instruct')
-    parser.add_argument('--batch_size',       type=int,   default=4)
+    parser.add_argument('--batch_size',       type=int,   default=8)
     parser.add_argument('--epochs',           type=int,   default=50)
     parser.add_argument('--lr_flow',          type=float, default=3e-4)
     parser.add_argument('--lr_lora',          type=float, default=3e-5)
@@ -46,19 +50,32 @@ def compute_fde(pred, gt):
 
 def train():
     CONFIG = get_config()
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"device: {device}", flush=True)
+
+    dist.init_process_group(backend='nccl')
+    local_rank = int(os.environ['LOCAL_RANK'])
+    device = f'cuda:{local_rank}'
+    torch.cuda.set_device(device)
+    is_main = local_rank == 0
+
+    if is_main:
+        wandb.init(
+            project="ped-traj-pred",
+            name="phase2_ddp",
+            config=CONFIG
+        )
 
     os.makedirs(CONFIG['save_dir'], exist_ok=True)
 
-    print("loading nuScenes...", flush=True)
+    if is_main:
+        print("loading nuScenes...", flush=True)
     nusc = NuScenes(
         version=CONFIG['version'],
         dataroot=CONFIG['dataroot'],
         verbose=False
     )
 
-    print("building dataset...", flush=True)
+    if is_main:
+        print("building dataset...", flush=True)
     full_dataset = PedestrianDataset(nusc, CONFIG['dataroot'])
 
     val_size   = int(len(full_dataset) * CONFIG['val_split'])
@@ -68,18 +85,26 @@ def train():
         [train_size, val_size],
         generator=torch.Generator().manual_seed(42)
     )
-    print(f"train: {train_size} | val: {val_size}", flush=True)
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=CONFIG['batch_size'],
-        shuffle=True, collate_fn=collate_fn
+    if is_main:
+        print(f"train: {train_size} | val: {val_size}", flush=True)
+
+    train_sampler = DistributedSampler(train_dataset)
+    train_loader  = DataLoader(
+        train_dataset,
+        batch_size=CONFIG['batch_size'],
+        sampler=train_sampler,
+        collate_fn=collate_fn
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=CONFIG['batch_size'],
-        shuffle=False, collate_fn=collate_fn
+        val_dataset,
+        batch_size=CONFIG['batch_size'],
+        shuffle=False,
+        collate_fn=collate_fn
     )
 
-    print("loading model with lora...", flush=True)
+    if is_main:
+        print("loading model with lora...", flush=True)
     model = PedTrajModel(
         device=device,
         vlm_name=CONFIG['vlm_name'],
@@ -92,17 +117,26 @@ def train():
     model.projector = model.projector.to(device)
     model.flow      = model.flow.to(device)
 
-    print("loading phase 1 checkpoint...", flush=True)
+    if is_main:
+        print("loading phase 1 checkpoint...", flush=True)
     ckpt = torch.load(CONFIG['phase1_ckpt'], map_location=device)
     model.projector.load_state_dict(ckpt['projector'])
     model.flow.load_state_dict(ckpt['flow'])
-    print(f"loaded phase 1 checkpoint from epoch {ckpt['epoch']}", flush=True)
+    if is_main:
+        print(f"loaded phase 1 checkpoint from epoch {ckpt['epoch']}", flush=True)
+
+    model.projector = DDP(model.projector, device_ids=[local_rank])
+    model.flow      = DDP(model.flow,      device_ids=[local_rank])
 
     lora_params = [p for p in model.vlm.parameters() if p.requires_grad]
-    flow_params  = list(model.projector.parameters()) + list(model.flow.parameters())
+    flow_params  = (
+        list(model.projector.parameters()) +
+        list(model.flow.parameters())
+    )
 
-    print(f"lora params: {sum(p.numel() for p in lora_params)/1e6:.2f}M", flush=True)
-    print(f"flow params: {sum(p.numel() for p in flow_params)/1e6:.2f}M", flush=True)
+    if is_main:
+        print(f"lora params: {sum(p.numel() for p in lora_params)/1e6:.2f}M", flush=True)
+        print(f"flow params: {sum(p.numel() for p in flow_params)/1e6:.2f}M", flush=True)
 
     optimizer = torch.optim.AdamW([
         {'params': flow_params, 'lr': CONFIG['lr_flow']},
@@ -115,6 +149,7 @@ def train():
     best_val_loss = float('inf')
 
     for epoch in range(1, CONFIG['epochs'] + 1):
+        train_sampler.set_epoch(epoch)
         model.projector.train()
         model.flow.train()
         model.vlm.train()
@@ -128,14 +163,17 @@ def train():
             optimizer.zero_grad()
             loss = model(images, obs, pred_gt)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(flow_params + lora_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(
+                flow_params + lora_params, max_norm=1.0
+            )
             optimizer.step()
 
             train_loss += loss.item()
 
-            if batch_idx % CONFIG['log_every'] == 0:
+            if is_main and batch_idx % CONFIG['log_every'] == 0:
                 print(f"  epoch {epoch} | batch {batch_idx}/{len(train_loader)} "
                       f"| loss: {loss.item():.4f}", flush=True)
+                wandb.log({'train_loss_step': loss.item()})
 
         scheduler.step()
         avg_train_loss = train_loss / len(train_loader)
@@ -149,46 +187,61 @@ def train():
         val_fde  = 0.0
         n_val    = 0
 
-        with torch.no_grad():
-            for batch in val_loader:
-                obs     = batch['obs'].to(device)
-                pred_gt = batch['pred_gt'].to(device)
-                images  = batch['images']
+        if is_main:
+            with torch.no_grad():
+                for batch in val_loader:
+                    obs     = batch['obs'].to(device)
+                    pred_gt = batch['pred_gt'].to(device)
+                    images  = batch['images']
 
-                loss = model(images, obs, pred_gt)
-                val_loss += loss.item()
+                    loss = model(images, obs, pred_gt)
+                    val_loss += loss.item()
 
-                preds = model.predict(images[:1], obs[:1], n_samples=6)
-                val_ade += compute_ade(preds, pred_gt[0])
-                val_fde += compute_fde(preds, pred_gt[0])
-                n_val   += 1
+                    preds = model.predict(images[:1], obs[:1], n_samples=6)
+                    val_ade += compute_ade(preds, pred_gt[0])
+                    val_fde += compute_fde(preds, pred_gt[0])
+                    n_val   += 1
 
-        avg_val_loss = val_loss / len(val_loader)
-        avg_ade      = val_ade  / n_val
-        avg_fde      = val_fde  / n_val
+            avg_val_loss = val_loss / len(val_loader)
+            avg_ade      = val_ade  / n_val
+            avg_fde      = val_fde  / n_val
 
-        print(f"\nepoch {epoch}/{CONFIG['epochs']} | "
-              f"train: {avg_train_loss:.4f} | "
-              f"val: {avg_val_loss:.4f} | "
-              f"minADE: {avg_ade:.3f}m | "
-              f"minFDE: {avg_fde:.3f}m\n", flush=True)
+            print(f"\nepoch {epoch}/{CONFIG['epochs']} | "
+                  f"train: {avg_train_loss:.4f} | "
+                  f"val: {avg_val_loss:.4f} | "
+                  f"minADE: {avg_ade:.3f}m | "
+                  f"minFDE: {avg_fde:.3f}m\n", flush=True)
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            ckpt_path = os.path.join(CONFIG['save_dir'], 'best_model.pt')
-            torch.save({
+            wandb.log({
                 'epoch':      epoch,
-                'projector':  model.projector.state_dict(),
-                'flow':       model.flow.state_dict(),
-                'vlm_lora':   model.vlm.state_dict(),
-                'optimizer':  optimizer.state_dict(),
+                'train_loss': avg_train_loss,
                 'val_loss':   avg_val_loss,
-                'ade':        avg_ade,
-                'fde':        avg_fde,
-            }, ckpt_path)
-            print(f"saved best model at {ckpt_path}", flush=True)
+                'minADE':     avg_ade,
+                'minFDE':     avg_fde
+            })
 
-    print(f"\ntraining complete, best val loss: {best_val_loss:.4f}")
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                ckpt_path = os.path.join(CONFIG['save_dir'], 'best_model.pt')
+                torch.save({
+                    'epoch':      epoch,
+                    'projector':  model.projector.module.state_dict(),
+                    'flow':       model.flow.module.state_dict(),
+                    'vlm_lora':   model.vlm.state_dict(),
+                    'optimizer':  optimizer.state_dict(),
+                    'val_loss':   avg_val_loss,
+                    'ade':        avg_ade,
+                    'fde':        avg_fde,
+                }, ckpt_path)
+                print(f"saved best model at {ckpt_path}", flush=True)
+
+        dist.barrier()
+
+    if is_main:
+        wandb.finish()
+        print(f"\ntraining complete, best val loss: {best_val_loss:.4f}")
+
+    dist.destroy_process_group()
 
 
 if __name__ == '__main__':
