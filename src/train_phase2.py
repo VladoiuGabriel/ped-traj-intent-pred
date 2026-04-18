@@ -23,7 +23,7 @@ def get_config():
     parser.add_argument('--phase1_ckpt',      default='/home/student02/data/checkpoints/best_model.pt')
     parser.add_argument('--version',          default='v1.0-mini')
     parser.add_argument('--vlm_name',         default='Qwen/Qwen2.5-VL-3B-Instruct')
-    parser.add_argument('--batch_size',       type=int,   default=8)
+    parser.add_argument('--batch_size',       type=int,   default=4)
     parser.add_argument('--epochs',           type=int,   default=50)
     parser.add_argument('--lr_flow',          type=float, default=3e-4)
     parser.add_argument('--lr_lora',          type=float, default=3e-5)

@@ -140,6 +140,7 @@ class PedTrajModel(nn.Module):
         super().__init__()
         self.device = device
         self.sigma = sigma
+        self.n_waypoints = 6
         self.waypoint_dropout = waypoint_dropout
 
         print("Loading Qwen2.5-VL-3B...", flush=True)
@@ -280,7 +281,7 @@ class PedTrajModel(nn.Module):
         context = self.projector(planning_token)
         ctx = context.expand(n_samples, -1, -1)
 
-        x = torch.randn(n_samples, self.flow.n_waypoints, 2, device=self.device) * self.sigma
+        x = torch.randn(n_samples, self.n_waypoints, 2, device=self.device) * self.sigma
         dt = 1.0 / steps
 
         for i in range(steps):
