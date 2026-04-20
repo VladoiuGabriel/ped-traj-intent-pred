@@ -19,8 +19,8 @@ import argparse
 def get_config():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataroot',         default='/home/student02/data/nuscenes')
-    parser.add_argument('--save_dir',         default='/home/student02/data/checkpoints/phase2')
-    parser.add_argument('--phase1_ckpt',      default='/home/student02/data/checkpoints/best_model.pt')
+    parser.add_argument('--save_dir', default='/home/student02/data/checkpoints/phase2_v2')
+    parser.add_argument('--phase1_ckpt',      default='/home/student02/data/checkpoints/phase1_v2/best_model.pt')
     parser.add_argument('--version',          default='v1.0-mini')
     parser.add_argument('--vlm_name',         default='Qwen/Qwen2.5-VL-3B-Instruct')
     parser.add_argument('--batch_size',       type=int,   default=4)

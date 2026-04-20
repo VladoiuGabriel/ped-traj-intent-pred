@@ -39,7 +39,7 @@ class PedestrianDataset(Dataset):
                 continue
 
             
-            origin = traj['obs'][0].copy()
+            origin = traj['obs'][-1].copy()
             obs_norm  = traj['obs']  - origin
             pred_norm = traj['pred'] - origin
 
