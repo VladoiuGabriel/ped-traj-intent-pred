@@ -19,8 +19,8 @@ import argparse
 def get_config():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataroot',         default='/home/student02/data/nuscenes')
-    parser.add_argument('--save_dir', default='/home/student02/data/checkpoints/phase2_v2')
-    parser.add_argument('--phase1_ckpt',      default='/home/student02/data/checkpoints/phase1_v2/best_model.pt')
+    parser.add_argument('--save_dir',         default='/home/student02/data/checkpoints/phase2_v3')
+    parser.add_argument('--phase1_ckpt',      default='/home/student02/data/checkpoints/phase1_v3/best_model.pt')
     parser.add_argument('--version',          default='v1.0-mini')
     parser.add_argument('--vlm_name',         default='Qwen/Qwen2.5-VL-3B-Instruct')
     parser.add_argument('--batch_size',       type=int,   default=4)
@@ -116,12 +116,18 @@ def train():
     )
     model.projector = model.projector.to(device)
     model.flow      = model.flow.to(device)
+    model.plan_norm   = model.plan_norm.to(device)
+    model.obs_encoder = model.obs_encoder.to(device)
 
     if is_main:
         print("loading phase 1 checkpoint...", flush=True)
+    
     ckpt = torch.load(CONFIG['phase1_ckpt'], map_location=device)
     model.projector.load_state_dict(ckpt['projector'])
     model.flow.load_state_dict(ckpt['flow'])
+    model.plan_norm.load_state_dict(ckpt['plan_norm'])
+    model.obs_encoder.load_state_dict(ckpt['obs_encoder'])
+    
     if is_main:
         print(f"loaded phase 1 checkpoint from epoch {ckpt['epoch']}", flush=True)
 
@@ -131,7 +137,9 @@ def train():
     lora_params = [p for p in model.vlm.parameters() if p.requires_grad]
     flow_params  = (
         list(model.projector.parameters()) +
-        list(model.flow.parameters())
+        list(model.flow.parameters()) +
+        list(model.plan_norm.parameters()) +
+        list(model.obs_encoder.parameters())    
     )
 
     if is_main:
@@ -153,6 +161,8 @@ def train():
         model.projector.train()
         model.flow.train()
         model.vlm.train()
+        model.plan_norm.train()
+        model.obs_encoder.train()
 
         train_loss = 0.0
         for batch_idx, batch in enumerate(train_loader):
@@ -181,6 +191,8 @@ def train():
         model.projector.eval()
         model.flow.eval()
         model.vlm.eval()
+        model.plan_norm.eval()
+        model.obs_encoder.eval()
 
         val_loss = 0.0
         val_ade  = 0.0
@@ -228,6 +240,8 @@ def train():
                     'projector':  model.projector.module.state_dict(),
                     'flow':       model.flow.module.state_dict(),
                     'vlm_lora':   model.vlm.state_dict(),
+                    'plan_norm':   model.plan_norm.state_dict(),
+                    'obs_encoder': model.obs_encoder.state_dict(),
                     'optimizer':  optimizer.state_dict(),
                     'val_loss':   avg_val_loss,
                     'ade':        avg_ade,

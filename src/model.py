@@ -182,6 +182,13 @@ class PedTrajModel(nn.Module):
             print("Qwen2-VL-3B loaded and frozen", flush=True)
 
         self.projector = PlanningTokenProjector(vlm_dim=2048, flow_dim=256)
+        self.plan_norm = nn.LayerNorm(2048)
+        
+        self.obs_encoder = nn.Sequential(
+            nn.Linear(4 * 2, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256)
+        )
 
         self.flow = TrajectoryFlowDiT(
             n_waypoints=6,
@@ -262,7 +269,7 @@ class PedTrajModel(nn.Module):
         t_exp = t[:, None, None]
 
         x_t = (1 - t_exp) * z + t_exp * x0
-        v_target = x0 - z
+        v_target = (x0 - x_t) / (1 - t_exp + 1e-8)
         v_pred = self.flow(x_t, t, context)
 
         return nn.functional.mse_loss(v_pred, v_target)
@@ -271,17 +278,24 @@ class PedTrajModel(nn.Module):
         """training forward pass"""
         obs = self.apply_waypoint_dropout(obs)
         planning_token = self.get_planning_token(images, obs)
-        context = self.projector(planning_token)
+        context = self.projector(self.plan_norm(planning_token))
+        obs_flat = obs.reshape(obs.shape[0], -1)
+        obs_enc = self.obs_encoder(obs_flat).unsqueeze(1)
+        context = context + obs_enc
         return self.flow_matching_loss(context, pred_gt)
 
     @torch.no_grad()
     def predict(self, images, obs, n_samples=6, steps=50):
         """generates n_samples trajectories via euler integration"""
         planning_token = self.get_planning_token(images, obs)
-        context = self.projector(planning_token)
+        context = self.projector(self.plan_norm(planning_token))
+        obs_flat = obs.reshape(obs.shape[0], -1)
+        obs_enc = self.obs_encoder(obs_flat).unsqueeze(1)
+        context = context + obs_enc
         ctx = context.expand(n_samples, -1, -1)
-
+    
         x = torch.randn(n_samples, self.n_waypoints, 2, device=self.device) * self.sigma
+        
         dt = 1.0 / steps
 
         for i in range(steps):

@@ -93,10 +93,14 @@ def train():
     )
     model.projector = model.projector.to(device)
     model.flow      = model.flow.to(device)
-
+    model.plan_norm   = model.plan_norm.to(device)
+    model.obs_encoder = model.obs_encoder.to(device)
+    
     trainable_params = (
         list(model.projector.parameters()) +
-        list(model.flow.parameters())
+        list(model.flow.parameters()) +
+        list(model.plan_norm.parameters()) +
+        list(model.obs_encoder.parameters())
     )
     print(f"trainable params: {sum(p.numel() for p in trainable_params)/1e6:.2f}M", flush=True)
 
@@ -111,6 +115,8 @@ def train():
         model.projector.train()
         model.flow.train()
         model.vlm.eval()
+        model.plan_norm.train()
+        model.obs_encoder.train()
 
         train_loss = 0.0
         for batch_idx, batch in enumerate(train_loader):
@@ -136,7 +142,9 @@ def train():
 
         model.projector.eval()
         model.flow.eval()
-
+        model.plan_norm.eval()
+        model.obs_encoder.eval()
+        
         val_loss = 0.0
         val_ade  = 0.0
         val_fde  = 0.0
@@ -182,6 +190,8 @@ def train():
                 'epoch':      epoch,
                 'projector':  model.projector.state_dict(),
                 'flow':       model.flow.state_dict(),
+                'plan_norm':  model.plan_norm.state_dict(),
+                'obs_encoder': model.obs_encoder.state_dict(),
                 'optimizer':  optimizer.state_dict(),
                 'val_loss':   avg_val_loss,
                 'ade':        avg_ade,
