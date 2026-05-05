@@ -154,14 +154,14 @@ class PedTrajModel(nn.Module):
         self.vlm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             vlm_name,
             torch_dtype=torch.bfloat16,
-             device_map={"": device}
+            device_map={"": device}
         )
         self.vlm.resize_token_embeddings(len(self.processor.tokenizer))
         self.vlm.gradient_checkpointing_enable()
 
         for param in self.vlm.parameters():
             param.requires_grad = False
-        
+
         if use_lora:
             lora_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
@@ -176,14 +176,13 @@ class PedTrajModel(nn.Module):
                 if 'visual' in name and 'lora' not in name:
                     param.requires_grad = False
             self.vlm.print_trainable_parameters()
-
             print("Qwen2-VL-3B Lora Training ready", flush=True)
         else:
             print("Qwen2-VL-3B loaded and frozen", flush=True)
 
         self.projector = PlanningTokenProjector(vlm_dim=2048, flow_dim=256)
         self.plan_norm = nn.LayerNorm(2048)
-        
+
         self.obs_encoder = nn.Sequential(
             nn.Linear(4 * 2, 256),
             nn.ReLU(),
@@ -198,6 +197,14 @@ class PedTrajModel(nn.Module):
             num_heads=4,
             depth=4
         )
+
+    @staticmethod
+    def polar_to_cartesian(x):
+        r     = x[..., 0:1]
+        theta = x[..., 1:2]
+        cart_x = r * torch.cos(theta)
+        cart_y = r * torch.sin(theta)
+        return torch.cat([cart_x, cart_y], dim=-1)
 
     def get_planning_token(self, images, obs):
         """runs vlm forward and extracts hidden state at [PLAN] position"""
@@ -246,7 +253,6 @@ class PedTrajModel(nn.Module):
             plan_pos = plan_positions[-1].item() if len(plan_positions) > 0 else -1
 
             hidden_raw = outputs.hidden_states[-1][0, plan_pos, :].to(torch.float32)
-            #print(f"sample {b} | dtype: {hidden_raw.dtype} | has nan: {torch.isnan(hidden_raw.float()).any().item()} | max abs: {hidden_raw.float().abs().max().item():.2f}")
             hidden = hidden_raw.float()
             planning_tokens.append(hidden)
 
@@ -262,7 +268,7 @@ class PedTrajModel(nn.Module):
         return obs * mask.unsqueeze(-1)
 
     def flow_matching_loss(self, context, x0):
-        """flow matching loss with sigma=0.1 noise"""
+        """flow matching loss in polar space"""
         b = x0.shape[0]
         z = torch.randn_like(x0) * self.sigma
         t = torch.rand(b, device=self.device)
@@ -275,7 +281,7 @@ class PedTrajModel(nn.Module):
         return nn.functional.mse_loss(v_pred, v_target)
 
     def forward(self, images, obs, pred_gt):
-        """training forward pass"""
+        """training forward pass — obs and pred_gt in polar coords"""
         obs = self.apply_waypoint_dropout(obs)
         planning_token = self.get_planning_token(images, obs)
         context = self.projector(self.plan_norm(planning_token))
@@ -286,16 +292,15 @@ class PedTrajModel(nn.Module):
 
     @torch.no_grad()
     def predict(self, images, obs, n_samples=6, steps=50):
-        """generates n_samples trajectories via euler integration"""
+        """generates n_samples trajectories via euler integration, returns cartesian"""
         planning_token = self.get_planning_token(images, obs)
         context = self.projector(self.plan_norm(planning_token))
         obs_flat = obs.reshape(obs.shape[0], -1)
         obs_enc = self.obs_encoder(obs_flat).unsqueeze(1)
         context = context + obs_enc
         ctx = context.expand(n_samples, -1, -1)
-    
+
         x = torch.randn(n_samples, self.n_waypoints, 2, device=self.device) * self.sigma
-        
         dt = 1.0 / steps
 
         for i in range(steps):
@@ -303,4 +308,4 @@ class PedTrajModel(nn.Module):
             v = self.flow(x, t, ctx)
             x = x + v * dt
 
-        return x
+        return self.polar_to_cartesian(x)

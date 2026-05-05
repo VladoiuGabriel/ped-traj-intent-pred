@@ -7,20 +7,25 @@ from dataloader import get_pedestrian_trajectories
 import os
 
 
+def cartesian_to_polar(coords):
+    r = np.linalg.norm(coords, axis=-1, keepdims=True)
+    theta = np.arctan2(coords[..., 1:2], coords[..., 0:1])
+    return np.concatenate([r, theta], axis=-1)
+
+
 class PedestrianDataset(Dataset):
     """
     PyTorch dataset for pedestrian trajectory prediction
     each sample contains:
       - image:   CAM_FRONT image at the last observed frame
-      - obs:     (4, 2) observed trajectory (normalized)
-      - pred_gt: (6, 2) ground truth future trajectory (normalized)
+      - obs:     (4, 2) observed trajectory in polar coords (r, theta)
+      - pred_gt: (6, 2) ground truth future trajectory in polar coords (r, theta)
     """
 
     def __init__(self, nusc, dataroot, only_moving=True, min_displacement=0.5):
         self.nusc = nusc
         self.dataroot = dataroot
 
-    
         raw_trajs = get_pedestrian_trajectories(nusc)
 
         self.samples = []
@@ -33,35 +38,31 @@ class PedestrianDataset(Dataset):
                 if displacement < min_displacement:
                     continue
 
-          
             img_path = self._get_cam_front_path(traj['instance_token'], traj['obs'])
             if img_path is None:
                 continue
 
-            
             origin = traj['obs'][-1].copy()
             obs_norm  = traj['obs']  - origin
             pred_norm = traj['pred'] - origin
 
+            obs_polar  = cartesian_to_polar(obs_norm)
+            pred_polar = cartesian_to_polar(pred_norm)
+
             self.samples.append({
                 'img_path': img_path,
-                'obs':      obs_norm.astype(np.float32),
-                'pred_gt':  pred_norm.astype(np.float32),
+                'obs':      obs_polar.astype(np.float32),
+                'pred_gt':  pred_polar.astype(np.float32),
                 'origin':   origin.astype(np.float32)
             })
 
         print(f"Dataset built: {len(self.samples)} samples")
 
     def _get_cam_front_path(self, instance_token, obs_positions):
-        """
-        Find the CAM_FRONT image path corresponding to the
-        last observed frame of this pedestrian instance.
-        """
         try:
             instance = self.nusc.get('instance', instance_token)
             ann_token = instance['first_annotation_token']
 
-            
             n_obs = len(obs_positions)
             count = 0
             last_ann = None
@@ -77,10 +78,8 @@ class PedestrianDataset(Dataset):
             if last_ann is None:
                 return None
 
-          
             sample = self.nusc.get('sample', last_ann['sample_token'])
 
-           
             cam_token = sample['data']['CAM_FRONT']
             cam_data  = self.nusc.get('sample_data', cam_token)
             img_path  = os.path.join(self.dataroot, cam_data['filename'])
@@ -107,10 +106,6 @@ class PedestrianDataset(Dataset):
 
 
 def collate_fn(batch):
-    """
-    Custom collate: images stay as list of PIL Images
-    (CLIP processor handles them), tensors are stacked normally.
-    """
     return {
         'images':  [b['image']  for b in batch],
         'obs':     torch.stack([b['obs']     for b in batch]),
