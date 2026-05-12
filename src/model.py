@@ -181,8 +181,8 @@ class PedTrajModel(nn.Module):
         else:
             print("Qwen2-VL-3B loaded and frozen", flush=True)
 
-        self.projector = PlanningTokenProjector(vlm_dim=2048, flow_dim=256)
-        self.plan_norm = nn.LayerNorm(2048)
+        self.projector = PlanningTokenProjector(vlm_dim=4*2048, flow_dim=256)
+        self.plan_norm = nn.LayerNorm(4*2048)
         
         self.obs_encoder = nn.Sequential(
             nn.Linear(4 * 2, 256),
@@ -245,8 +245,10 @@ class PedTrajModel(nn.Module):
             plan_positions = (input_ids == self.plan_token_id).nonzero(as_tuple=True)[0]
             plan_pos = plan_positions[-1].item() if len(plan_positions) > 0 else -1
 
-            hidden_raw = outputs.hidden_states[-1][0, plan_pos, :].to(torch.float32)
-            #print(f"sample {b} | dtype: {hidden_raw.dtype} | has nan: {torch.isnan(hidden_raw.float()).any().item()} | max abs: {hidden_raw.float().abs().max().item():.2f}")
+            sparse_layers = [-1, -3, -5, -7]
+            hidden_states = [outputs.hidden_states[i][0, plan_pos, :].to(torch.float32)
+                            for i in sparse_layers]
+            hidden_raw = torch.cat(hidden_states, dim=-1)
             hidden = hidden_raw.float()
             planning_tokens.append(hidden)
 
