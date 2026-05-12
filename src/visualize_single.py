@@ -12,10 +12,18 @@ from model import PedTrajModel
 import argparse
 
 
+def polar_to_cartesian_np(coords):
+    r     = coords[..., 0:1]
+    theta = coords[..., 1:2]
+    x = r * np.cos(theta)
+    y = r * np.sin(theta)
+    return np.concatenate([x, y], axis=-1)
+
+
 def load_model(ckpt_path, device, use_lora=False):
     model = PedTrajModel(device=device, use_lora=use_lora)
-    model.projector = model.projector.to(device)
-    model.flow      = model.flow.to(device)
+    model.projector   = model.projector.to(device)
+    model.flow        = model.flow.to(device)
     model.plan_norm   = model.plan_norm.to(device)
     model.obs_encoder = model.obs_encoder.to(device)
 
@@ -63,12 +71,12 @@ def visualize(ckpt_path, dataroot, use_lora, n_examples, label, device):
         obs_raw   = obs[0].cpu().numpy()
         gt_raw    = pred_gt[0].cpu().numpy()
         preds_raw = preds.cpu().numpy()
-        
-        obs_norm   = obs_raw
-        gt_norm    = gt_raw
-        preds_norm = preds_raw
 
-        gt_exp  = torch.tensor(gt_raw).unsqueeze(0).expand(6, -1, -1)
+        obs_cart   = polar_to_cartesian_np(obs_raw)
+        gt_cart    = polar_to_cartesian_np(gt_raw)
+
+
+        gt_exp  = torch.tensor(gt_cart).unsqueeze(0).expand(6, -1, -1)
         ade_per = torch.norm(torch.tensor(preds_raw) - gt_exp, dim=-1).mean(dim=-1)
         min_ade = ade_per.min().item()
 
@@ -76,16 +84,16 @@ def visualize(ckpt_path, dataroot, use_lora, n_examples, label, device):
 
         colors = plt.cm.Reds(np.linspace(0.4, 0.9, 6))
         for k in range(6):
-            x = preds_norm[k, :, 0]
-            y = preds_norm[k, :, 1]
+            x = preds_raw[k, :, 0]
+            y = preds_raw[k, :, 1]
             ax.plot(x, y, color=colors[k], linewidth=1.5, alpha=0.8)
             ax.scatter(x, y, color=colors[k], s=15, alpha=0.8, zorder=3)
 
-        ax.plot(obs_norm[:, 0], obs_norm[:, 1],
+        ax.plot(obs_cart[:, 0], obs_cart[:, 1],
                 'b-o', linewidth=2, markersize=4, label='obs')
-        ax.plot(gt_norm[:, 0], gt_norm[:, 1],
+        ax.plot(gt_cart[:, 0], gt_cart[:, 1],
                 'g--o', linewidth=2, markersize=4, label='gt')
-        ax.plot(obs_norm[-1, 0], obs_norm[-1, 1], 'ko', markersize=6)
+        ax.plot(obs_cart[-1, 0], obs_cart[-1, 1], 'ko', markersize=6)
 
         ax.set_title(f'ADE: {min_ade:.2f}m', fontsize=8)
         ax.set_aspect('equal')
