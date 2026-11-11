@@ -3,7 +3,7 @@
 Predict where a pedestrian will walk next from a few observed positions and the front-camera image, using flow matching and a vision-language model for scene context.
 
 <p align="center">
-  <img src="docs/architecture.png" width="900" alt="Architecture overview">
+  <img src="architecture.png" width="900" alt="Architecture overview">
 </p>
 
 ## Context
